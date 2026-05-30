@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from copy import deepcopy
+from dataclasses import dataclass
 from typing import Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -123,7 +124,13 @@ class ConfigService:
             else:
                 status = "unconfigured"
                 missing = list(meta.required_keys)
-            models_dict = {mid: asdict(mi) for mid, mi in meta.models.items()}
+            # 先按 __dict__ 排除 pricing（其费率含 tuple 键，非 JSON 可序列化且响应不消费；
+            # 用 __dict__ 而非 asdict 以免递归转换 pricing 后又被丢弃），再 deepcopy 其余可变容器
+            # 字段（list/dict），避免返回值与全局 PROVIDER_REGISTRY 共享引用被调用方意外改写。
+            models_dict = {
+                mid: deepcopy({k: v for k, v in mi.__dict__.items() if k != "pricing"})
+                for mid, mi in meta.models.items()
+            }
             statuses.append(
                 ProviderStatus(
                     name=name,
