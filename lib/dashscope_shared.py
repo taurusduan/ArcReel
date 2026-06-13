@@ -22,6 +22,7 @@ from pathlib import Path
 
 import httpx
 
+from lib.db.repositories.usage_repo import MAX_BILLED_DURATION_SECONDS
 from lib.retry import BASE_RETRYABLE_ERRORS
 
 logger = logging.getLogger(__name__)
@@ -189,13 +190,19 @@ def extract_billing_duration(payload: dict) -> int | None:
     """从 usage.duration 取真实计费时长（wan2.7-r2v 含输入视频时长）。
 
     容忍 int / float / 数字字符串；按 half-up 取整（4.5→5）而非截断或银行家舍入，避免少计费秒数。
-    非正值（0 / 负 / 无法解析）一律回 None，由 caller 回落请求时长，不记 0 秒账。
+    非正值（0 / 负 / 无法解析）与超出合理上限（24h，防超大数值写入 DB Integer 列溢出）
+    一律回 None，由 caller 回落请求时长，不记 0 秒账。
     """
     raw = _as_dict(payload.get("usage")).get("duration")
     if raw is None:
         return None
     try:
-        value = int(Decimal(str(raw)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        decimal_value = Decimal(str(raw))
+        # 上限基于取整前的原始数值判断：86400.4 已超 24h，不得因 half-up 落回上限内被接受
+        # （NaN 参与比较抛 InvalidOperation，与解析失败同路径回 None）
+        if not 0 < decimal_value <= MAX_BILLED_DURATION_SECONDS:
+            return None
+        value = int(decimal_value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
     except (InvalidOperation, TypeError, ValueError):
         return None
     return value if value > 0 else None

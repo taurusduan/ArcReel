@@ -8,6 +8,7 @@ import logging
 from datetime import timedelta
 from pathlib import Path
 
+from lib.db.repositories.usage_repo import MAX_BILLED_DURATION_SECONDS
 from lib.grok_shared import create_grok_client, grok_should_retry
 from lib.logging_utils import format_kwargs_for_log
 from lib.providers import PROVIDER_GROK
@@ -69,7 +70,24 @@ class GrokVideoBackend:
         response = await self._create_video(request)
 
         video_url = response.url
-        actual_duration = getattr(response, "duration", request.duration_seconds)
+        # SDK 响应字段未类型化，收窄为 int 才能作为实际计费时长落账本的 Integer 列；
+        # 先经 float 接受 "15.0" 这类浮点字符串。缺失/不可解析（含 inf/nan）/非正/
+        # 超出合理上限的值回落请求时长，保证结果恒为正且可落库。
+        raw_duration = getattr(response, "duration", None)
+        actual_duration = request.duration_seconds
+        try:
+            if raw_duration is not None:
+                parsed = float(raw_duration)
+                # 上下限基于取整前的原始数值判断：86400.9 已超 24h，不得因取整落回上限内被接受
+                if 0 < parsed <= MAX_BILLED_DURATION_SECONDS:
+                    # half-up 取整与 dashscope extract_billing_duration 同口径，避免截断少计费秒数；
+                    # (0, 0.5) 取整到 0 时同样回落，保持结果恒为正
+                    rounded = int(parsed + 0.5)
+                    if rounded > 0:
+                        actual_duration = rounded
+        except (TypeError, ValueError, OverflowError):
+            # 解析失败属预期内回落（SDK 字段未类型化），保留请求时长即可，无需上抛
+            logger.debug("Grok 回报的 duration 无法解析: %r，回落请求时长 %s 秒", raw_duration, actual_duration)
 
         await download_video(video_url, request.output_path)
         logger.info("Grok 视频下载完成: %s", request.output_path)

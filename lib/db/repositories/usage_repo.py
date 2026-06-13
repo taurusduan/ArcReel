@@ -14,6 +14,11 @@ from lib.db.models.api_call import ApiCall
 from lib.db.repositories.base import BaseRepository, rowcount
 from lib.providers import PROVIDER_GEMINI, CallType
 
+# 计费时长合理上限（24 小时），语义单点定义：repo 写入层是全部 backend 落账的最后防线，
+# 超出上限的计费时长视同未提供、回落请求时长，防超大数值写入 DB Integer 列溢出；
+# 解析侧（grok / dashscope extractor）的 clamp 引用同一常量，保持口径一致。
+MAX_BILLED_DURATION_SECONDS = 86400
+
 
 def _classify_asset_output_path(output_path: str | None) -> str:
     """从 api_call.output_path 推断资产类型（characters/scenes/props/products/other）。
@@ -115,6 +120,7 @@ class UsageRepository(BaseRepository):
         service_tier: str = "default",
         usage_tokens: int | None = None,
         generate_audio: bool | None = None,
+        billed_duration_seconds: int | None = None,
     ) -> int:
         """Resume 路径专用：按 call_id 精准翻 pending → success/failed。
 
@@ -131,6 +137,9 @@ class UsageRepository(BaseRepository):
         透传：Ark video 按 usage_tokens 计费，未传则 cost 永远为 0；其它 provider 不依赖该字段。
         generate_audio 由 caller 从 backend 返回值透传：provider 在 submit 后可能降级/关闭音频，
         与 finish_call 的 ``generate_audio is not None`` 覆盖语义对齐，避免按请求值误计费。
+        billed_duration_seconds 同样由 caller 从 backend 返回值透传：provider 回报的实际计费
+        时长覆盖请求时长（与 finish_call 同覆盖语义，非正值视同未提供），保证同一笔调用
+        无论经 generate 还是 resume 完成，账本时长与自动 cost 口径一致。
         duration_ms 按 (finished_at - started_at) 回写，让 get_stats_grouped_by_provider
         的时长汇总不会因 resume 完成的调用 duration_ms=NULL 而系统性压低。
         provider 端已扣费的事实通过 status='pending' WHERE 保护——绝不触发再次扣费。
@@ -155,6 +164,15 @@ class UsageRepository(BaseRepository):
         # backend 回写的实际 generate_audio 覆盖 start_call 时的请求值
         # （与 finish_call 同语义；用于 cost_calculator 输入及 UPDATE 回写）
         effective_generate_audio = generate_audio if generate_audio is not None else row.generate_audio
+
+        # provider 回报的实际计费时长覆盖请求时长（与 finish_call 同覆盖语义，非正或超出
+        # 合理上限视同未提供）。走局部变量 + UPDATE 列回写而非 ORM 属性赋值，让覆盖继续受
+        # WHERE status='pending' 幂等守卫保护，不被 autoflush 绕过。
+        effective_duration_seconds = (
+            billed_duration_seconds
+            if billed_duration_seconds is not None and 0 < billed_duration_seconds <= MAX_BILLED_DURATION_SECONDS
+            else row.duration_seconds
+        )
 
         final_cost_amount = 0.0
         final_currency = currency or "USD"
@@ -183,7 +201,7 @@ class UsageRepository(BaseRepository):
                 model=row.model,
                 resolution=row.resolution,
                 aspect_ratio=row.aspect_ratio,
-                duration_seconds=row.duration_seconds,
+                duration_seconds=effective_duration_seconds,
                 generate_audio=bool(effective_generate_audio),
                 service_tier=service_tier,
                 usage_tokens=usage_tokens,
@@ -199,6 +217,7 @@ class UsageRepository(BaseRepository):
                 status=status,
                 finished_at=finished_at,
                 duration_ms=duration_ms,
+                duration_seconds=effective_duration_seconds,
                 cost_amount=final_cost_amount,
                 currency=final_currency,
                 usage_tokens=usage_tokens,
@@ -230,6 +249,7 @@ class UsageRepository(BaseRepository):
         text_output_tokens: int | None = None,
         cost_amount: float | None = None,
         currency: str | None = None,
+        billed_duration_seconds: int | None = None,
     ) -> None:
         finished_at = utc_now()
 
@@ -238,9 +258,18 @@ class UsageRepository(BaseRepository):
         if not row:
             return
 
+        # provider 回报的实际计费时长覆盖 start_call 时的请求时长（如 DashScope usage.duration
+        # 含输入参考视频时长）；非正或超出合理上限的值视同未提供，回落请求时长，不记 0 秒账。
+        # 显式 cost_amount 仍优先于按时长的自动计算，但实际计费时长照常回写账本。
+        # 走局部变量 + UPDATE 列回写而非 ORM 属性赋值，避免 autoflush 对同一行额外多发一条 UPDATE。
+        effective_duration_seconds = (
+            billed_duration_seconds
+            if billed_duration_seconds is not None and 0 < billed_duration_seconds <= MAX_BILLED_DURATION_SECONDS
+            else row.duration_seconds
+        )
+
         # 后端回写的实际 generate_audio 覆盖 start_call 时的请求值
-        if generate_audio is not None:
-            row.generate_audio = generate_audio
+        effective_generate_audio = generate_audio if generate_audio is not None else row.generate_audio
 
         # Calculate duration
         try:
@@ -286,8 +315,8 @@ class UsageRepository(BaseRepository):
                 model=row.model,
                 resolution=row.resolution,
                 aspect_ratio=row.aspect_ratio,
-                duration_seconds=row.duration_seconds,
-                generate_audio=bool(row.generate_audio),
+                duration_seconds=effective_duration_seconds,
+                generate_audio=bool(effective_generate_audio),
                 usage_tokens=usage_tokens,
                 service_tier=service_tier,
                 input_tokens=input_tokens,
@@ -311,6 +340,8 @@ class UsageRepository(BaseRepository):
                 status=status,
                 finished_at=finished_at,
                 duration_ms=duration_ms,
+                duration_seconds=effective_duration_seconds,
+                generate_audio=effective_generate_audio,
                 retry_count=retry_count,
                 cost_amount=final_cost_amount,
                 currency=final_currency,
