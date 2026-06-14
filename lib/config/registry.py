@@ -207,6 +207,11 @@ def _minimax_text_pricing(model_id: str, input_rate: float, output_rate: float) 
     )
 
 
+# MiniMax 图片费率（元/张），T2I 与 I2I 同价。
+def _minimax_image_pricing(model_id: str, per_image: float) -> PerImageFlat:
+    return PerImageFlat(rates={model_id: per_image}, default_model=model_id, currency="CNY")
+
+
 # MiniMax 海螺视频按 (分辨率, 时长) 离散档计费（元/次，CNY）。
 def _minimax_video_pricing(model_id: str, buckets: dict[tuple[str, int], float]) -> PerVideoBucket:
     return PerVideoBucket(rates={model_id: buckets}, default_model=model_id, currency="CNY")
@@ -948,6 +953,18 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 capabilities=["text_generation", "structured_output"],
                 default=True,
                 pricing=_minimax_text_pricing("MiniMax-M2.7", 2.1, 8.4),
+            ),
+            # --- image ---
+            # image-01：单步同步取 URL，T2I + I2I（subject_reference 单脸参考）；
+            # 尺寸用 width/height ∈ [512, 2048]（8 倍数），档位短边经精确比例算出。
+            "image-01": ModelInfo(
+                display_name="MiniMax Image 01",
+                media_type="image",
+                capabilities=["text_to_image", "image_to_image"],
+                default=True,
+                resolutions=["1K", "2K"],
+                max_reference_images=1,
+                pricing=_minimax_image_pricing("image-01", 0.025),
             ),
             # --- video ---
             # 1080P 仅 6s（10s 仅 768P）；细粒度越界由 MiniMaxVideoBackend 抛 VideoCapabilityError，
