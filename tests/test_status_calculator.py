@@ -95,11 +95,20 @@ class TestStatusCalculator:
         # Case 2: 脚本不存在，draft 文件存在 → ("segmented", None)
         draft_dir = project_path / "drafts" / "episode_2"
         draft_dir.mkdir(parents=True)
-        (draft_dir / "step1_segments.md").write_text("ok")
+        (draft_dir / "step1_segments.json").write_text("ok")
         calc2 = StatusCalculator(_FakePM(project_root, {}, {}))
         status2, script2 = calc2._load_episode_script("demo", 2, "scripts/episode_2.json")
         assert status2 == "segmented"
         assert script2 is None
+
+        # Case 2b: narration 仅有旧 step1_segments.md（存量）→ 仍认作 ("segmented", None)
+        draft_dir_legacy = project_path / "drafts" / "episode_6"
+        draft_dir_legacy.mkdir(parents=True)
+        (draft_dir_legacy / "step1_segments.md").write_text("legacy md")
+        calc_legacy = StatusCalculator(_FakePM(project_root, {}, {}))
+        status_legacy, script_legacy = calc_legacy._load_episode_script("demo", 6, "scripts/episode_6.json")
+        assert status_legacy == "segmented"
+        assert script_legacy is None
 
         # Case 3: 两者都不存在 → ("none", None)
         calc3 = StatusCalculator(_FakePM(project_root, {}, {}))
@@ -298,7 +307,7 @@ class TestStatusCalculator:
         """
         project_root = tmp_path / "projects"
         (project_root / "demo" / "drafts" / "episode_1").mkdir(parents=True)
-        (project_root / "demo" / "drafts" / "episode_1" / "step1_segments.md").write_text("ok", encoding="utf-8")
+        (project_root / "demo" / "drafts" / "episode_1" / "step1_segments.json").write_text("ok", encoding="utf-8")
         project = {
             "overview": {"synopsis": "test"},
             "characters": {},
